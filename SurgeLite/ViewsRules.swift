@@ -1,4 +1,5 @@
 import SwiftUI
+import UIKit
 
 // MARK: - 规则
 
@@ -56,10 +57,12 @@ struct RulesView: View {
                     }
                 }
             }
-            .environment(\.editMode, .constant(.active))
             .navigationTitle("规则")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
+                ToolbarItem(placement: .topBarLeading) {
+                    EditButton().font(.footnote)
+                }
                 ToolbarItem(placement: .topBarTrailing) {
                     Button { showAdd = true } label: { Image(systemName: "plus") }
                 }
@@ -285,35 +288,86 @@ struct ExportView: View {
     @Environment(\.dismiss) private var dismiss
     @State private var mode = 0
     @State private var fileURL: URL? = nil
+    @State private var copied = false
 
-    private let fileName = "SurgeLite-export.txt"
+    private var fileName: String {
+        switch mode {
+        case 0: return "SurgeLite-rules.txt"
+        case 1: return "SurgeLite-nodes.txt"
+        default: return "SurgeLite-subscription.txt"
+        }
+    }
+
+    private var preview: String {
+        switch mode {
+        case 0: return Exporter.surgeText(state: store.state)
+        case 1: return Exporter.nodeListText(state: store.state)
+        default: return Exporter.base64Subscription(state: store.state)
+        }
+    }
+
+    private var hint: String {
+        switch mode {
+        case 0: return "Surge / Stash 的 [Rule] 片段，可直接粘贴进配置"
+        case 1: return "逐行节点 URI，兼容 Shadowrocket、Karing 等"
+        default: return "Base64 订阅内容，粘到 Karing / sing-box / Stash 订阅导入框即可"
+        }
+    }
 
     var body: some View {
         NavigationStack {
             VStack(spacing: 12) {
                 Picker("内容", selection: $mode) {
-                    Text("规则片段").tag(0)
-                    Text("节点清单").tag(1)
+                    Text("规则").tag(0)
+                    Text("节点").tag(1)
+                    Text("订阅").tag(2)
                 }
                 .pickerStyle(.segmented)
                 .padding(.horizontal, 16)
 
+                Text(hint)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal, 16)
+
+                if mode == 2 {
+                    Text(Exporter.subscriptionSummary(store.state))
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.horizontal, 16)
+                }
+
                 ScrollView {
                     Text(preview)
                         .font(.system(.caption, design: .monospaced))
+                        .textSelection(.enabled)
                         .frame(maxWidth: .infinity, alignment: .leading)
                         .padding(12)
                 }
                 .background(Color(.secondarySystemBackground), in: RoundedRectangle(cornerRadius: 12))
                 .padding(.horizontal, 16)
 
+                Button {
+                    UIPasteboard.general.string = preview
+                    copied = true
+                } label: {
+                    Label(copied ? "已复制" : "复制到剪贴板", systemImage: copied ? "checkmark" : "doc.on.doc")
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 10)
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(preview.isEmpty)
+                .padding(.horizontal, 16)
+
                 if let fileURL = fileURL {
                     ShareLink(item: fileURL) {
-                        Label("导出文件", systemImage: "square.and.arrow.up")
+                        Label("导出为文件", systemImage: "square.and.arrow.up")
                             .frame(maxWidth: .infinity)
                             .padding(.vertical, 10)
                     }
-                    .buttonStyle(.borderedProminent)
+                    .buttonStyle(.bordered)
                     .padding(.horizontal, 16)
                 }
             }
@@ -324,12 +378,11 @@ struct ExportView: View {
                 ToolbarItem(placement: .topBarLeading) { Button("关闭") { dismiss() } }
             }
             .onAppear { writeFile() }
-            .onChange(of: mode) { _, _ in writeFile() }
+            .onChange(of: mode) { _, _ in
+                copied = false
+                writeFile()
+            }
         }
-    }
-
-    private var preview: String {
-        mode == 0 ? Exporter.surgeText(state: store.state) : Exporter.nodeListText(state: store.state)
     }
 
     private func writeFile() {
