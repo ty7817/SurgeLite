@@ -18,7 +18,7 @@ extension Exporter {
     }
 
     /// 标准 Base64 订阅（粘进 Karing / sing-box / Stash / Shadowrocket 可直接导入）
-    static func base64Subscription(_ state: AppState) -> String {
+    static func base64Subscription(state: AppState) -> String {
         let lines = exportableLines(state)
         guard !lines.isEmpty else { return "" }
         let text = lines.joined(separator: "\n")
@@ -27,7 +27,7 @@ extension Exporter {
     }
 
     /// 逐行 URI 清单（纯文本，方便自己改）
-    static func plainSubscription(_ state: AppState) -> String {
+    static func plainSubscription(state: AppState) -> String {
         let lines = exportableLines(state)
         guard !lines.isEmpty else { return "" }
         return lines.joined(separator: "\n")
