@@ -22,6 +22,9 @@ jobs:
           xcodebuild -version
           xcodebuild -showsdks | grep -i iphoneos || true
 
+      - name: Generate app icon
+        run: python3 Tools/make_icon.py SurgeLite/Assets.xcassets/AppIcon.appiconset/icon-1024.png
+
       - name: Install XcodeGen
         run: brew install xcodegen
 
@@ -96,7 +99,7 @@ jobs:
           name: SurgeLite build ${{ github.run_number }}
           body: |
             未签名 IPA，构建自 ${{ github.sha }}
-            安装前需要用 Sideloadly / ESign / AltStore 自行签名。
+            安装前需要用全能签 / Sideloadly / ESign / AltStore 自行签名。
           files: SurgeLite-unsigned.ipa
           draft: false
           prerelease: false
