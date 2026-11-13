@@ -41,10 +41,13 @@ struct ProxyNode: Identifiable, Codable, Hashable {
     var port: Int
     var raw: String = ""
     var region: String = "其他"
+    var source: String = "手动"
     var latency: Int? = nil
     var alive: Bool? = nil
 
     var endpoint: String { "\(server):\(port)" }
+
+    var dedupeKey: String { "\(kind.rawValue)|\(server)|\(port)" }
 }
 
 // MARK: - 规则
@@ -94,6 +97,7 @@ struct Subscription: Identifiable, Codable, Hashable {
     var url: String
     var updatedAt: Date = Date()
     var nodeCount: Int = 0
+    var enabled: Bool = true
     var autoUpdate: Bool = true
     var lastError: String = ""
 }
@@ -207,15 +211,24 @@ final class Store: ObservableObject {
 
     // MARK: 节点操作
 
-    func merge(nodes: [ProxyNode], subscription: Subscription?) {
-        let existing = Set(state.nodes.map { $0.raw.isEmpty ? "\($0.server):\($0.port)" : $0.raw })
-        var added: [ProxyNode] = []
-        for n in nodes {
-            let key = n.raw.isEmpty ? "\(n.server):\(n.port)" : n.raw
-            if existing.contains(key) { continue }
-            added.append(n)
+    /// 合并导入：按「协议 + 服务器 + 端口」去重，并记下来源订阅名
+    @discardableResult
+    func merge(nodes: [ProxyNode], subscription: Subscription?) -> (added: Int, skipped: Int) {
+        var existing = Set(state.nodes.map { $0.dedupeKey })
+        let sourceName = subscription?.name ?? "手动"
+        var added = 0
+        var skipped = 0
+
+        for var node in nodes {
+            if existing.contains(node.dedupeKey) {
+                skipped += 1
+                continue
+            }
+            node.source = sourceName
+            existing.insert(node.dedupeKey)
+            state.nodes.append(node)
+            added += 1
         }
-        state.nodes.append(contentsOf: added)
 
         if var sub = subscription {
             sub.nodeCount = nodes.count
@@ -227,10 +240,19 @@ final class Store: ObservableObject {
                 state.subscriptions.append(sub)
             }
         }
+        return (added, skipped)
     }
 
     func removeNode(_ node: ProxyNode) {
         state.nodes.removeAll { $0.id == node.id }
+    }
+
+    /// 删掉某个订阅带来的节点
+    func removeNodes(of source: String) {
+        state.nodes.removeAll { $0.source == source }
+        state.lastRanking.removeAll { row in
+            !state.nodes.contains { $0.name == row.name }
+        }
     }
 
     func sortNodesByLatency() {
