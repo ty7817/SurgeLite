@@ -12,16 +12,16 @@ enum Fetcher {
         if settings.proxyType != .none, settings.proxyPort > 0 {
             var dict: [AnyHashable: Any] = [:]
             if settings.proxyType == .http {
-                dict[kCFNetworkProxiesHTTPEnable as String] = 1
-                dict[kCFNetworkProxiesHTTPProxy as String] = settings.proxyHost
-                dict[kCFNetworkProxiesHTTPPort as String] = settings.proxyPort
-                dict[kCFNetworkProxiesHTTPSEnable as String] = 1
-                dict[kCFNetworkProxiesHTTPSProxy as String] = settings.proxyHost
-                dict[kCFNetworkProxiesHTTPSPort as String] = settings.proxyPort
+                dict["HTTPEnable"] = 1
+                dict["HTTPProxy"] = settings.proxyHost
+                dict["HTTPPort"] = settings.proxyPort
+                dict["HTTPSEnable"] = 1
+                dict["HTTPSProxy"] = settings.proxyHost
+                dict["HTTPSPort"] = settings.proxyPort
             } else {
-                dict[kCFNetworkProxiesSOCKSEnable as String] = 1
-                dict[kCFNetworkProxiesSOCKSProxy as String] = settings.proxyHost
-                dict[kCFNetworkProxiesSOCKSPort as String] = settings.proxyPort
+                dict["SOCKSEnable"] = 1
+                dict["SOCKSProxy"] = settings.proxyHost
+                dict["SOCKSPort"] = settings.proxyPort
             }
             cfg.connectionProxyDictionary = dict
         }
