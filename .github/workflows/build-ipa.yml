@@ -14,6 +14,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Show toolchain
         run: |
@@ -27,8 +29,10 @@ jobs:
         run: xcodegen generate
 
       - name: Build app
+        id: build
+        continue-on-error: true
         run: |
-          set -o pipefail
+          set +e
           xcodebuild \
             -project SurgeLite.xcodeproj \
             -scheme SurgeLite \
@@ -38,9 +42,35 @@ jobs:
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGN_IDENTITY="" \
-            build 2>&1 | tail -n 60
+            build > build.log 2>&1
+          echo "EXIT_CODE=$?" >> build.log
+          tail -n 80 build.log
+
+      - name: Publish build report
+        if: always()
+        run: |
+          {
+            echo "# Build report"
+            echo ""
+            echo "时间：$(date -u)"
+            echo ""
+            echo '```'
+            grep -nE "error:|warning:|BUILD FAILED|BUILD SUCCEEDED|The following build commands failed|EXIT_CODE" build.log | head -120 || true
+            echo '```'
+            echo ""
+            echo "## 日志尾部"
+            echo '```'
+            tail -n 40 build.log || true
+            echo '```'
+          } > build-report.md
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add build-report.md
+          git commit -m "ci: build report [skip ci]" || true
+          git push || true
 
       - name: Package IPA
+        if: steps.build.outcome == 'success'
         run: |
           set -e
           APP_PATH="build/Build/Products/Release-iphoneos/SurgeLite.app"
@@ -52,12 +82,14 @@ jobs:
           ls -lh SurgeLite-unsigned.ipa
 
       - name: Upload artifact
+        if: steps.build.outcome == 'success'
         uses: actions/upload-artifact@v4
         with:
           name: SurgeLite-unsigned-ipa
           path: SurgeLite-unsigned.ipa
 
       - name: Publish release
+        if: steps.build.outcome == 'success'
         uses: softprops/action-gh-release@v2
         with:
           tag_name: build-${{ github.run_number }}
