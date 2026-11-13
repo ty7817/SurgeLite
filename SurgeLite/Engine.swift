@@ -4,6 +4,13 @@ import Network
 // MARK: - 网络请求
 
 enum Fetcher {
+    static let userAgents = [
+        "Surge/5.26.0 CFNetwork/1490.0.4 Darwin/23.2.0",
+        "clash-verge/v1.7.1",
+        "Shadowrocket/2.2.20 CFNetwork/1490.0.4 Darwin/23.2.0",
+        "SurgeLite/1.1 (iOS)"
+    ]
+
     static func session(_ settings: AppSettings) -> URLSession {
         let cfg = URLSessionConfiguration.ephemeral
         cfg.timeoutIntervalForRequest = 20
@@ -29,29 +36,83 @@ enum Fetcher {
     }
 
     enum FetchError: LocalizedError {
-        case badURL, badBody, http(Int)
+        case badURL
+        case badBody
+        case http(Int)
+        case htmlPage(String)
+        case emptyBody
 
         var errorDescription: String? {
             switch self {
-            case .badURL: return "链接格式不正确"
-            case .badBody: return "内容不是文本，可能是链接失效"
-            case .http(let code): return "HTTP \(code)"
+            case .badURL:
+                return "链接不完整：需要包含 https:// 开头的完整地址（域名或路径片段不行）"
+            case .badBody:
+                return "内容不是文本，可能链接失效或需要重新获取"
+            case .http(let code):
+                return "服务器返回 HTTP \(code)，链接可能已过期或需要重新登录取 token"
+            case .htmlPage(let snippet):
+                return "服务器返回的是网页而不是订阅数据，常见原因：token 失效、需要特定客户端 UA、或这是一个网页短链。返回内容开头：\(snippet)"
+            case .emptyBody:
+                return "服务器返回空内容"
             }
         }
     }
 
+    private static func snippet(_ text: String, limit: Int = 100) -> String {
+        let flat = text.replacingOccurrences(of: "\n", with: " ")
+            .replacingOccurrences(of: "\r", with: " ")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return flat.count > limit ? String(flat.prefix(limit)) + "…" : flat
+    }
+
+    /// 拉订阅：自动去掉空白、补全 https，并按常见客户端 UA 重试
     static func fetch(_ urlString: String, settings: AppSettings) async throws -> String {
         var raw = urlString.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !raw.lowercased().hasPrefix("http") { raw = "https://" + raw }
-        guard let url = URL(string: raw) else { throw FetchError.badURL }
-        var req = URLRequest(url: url)
-        req.setValue("SurgeLite/1.0 (iOS)", forHTTPHeaderField: "User-Agent")
-        let (data, resp) = try await session(settings).data(for: req)
-        if let http = resp as? HTTPURLResponse, !(200...399).contains(http.statusCode) {
-            throw FetchError.http(http.statusCode)
+        raw = raw.replacingOccurrences(of: " ", with: "")
+            .replacingOccurrences(of: "\n", with: "")
+            .replacingOccurrences(of: "\r", with: "")
+        if raw.hasPrefix("\u{FEFF}") { raw.removeFirst() }
+
+        if !raw.lowercased().hasPrefix("http://") && !raw.lowercased().hasPrefix("https://") {
+            guard raw.contains("/"), raw.contains(".") else { throw FetchError.badURL }
+            raw = "https://" + raw
         }
-        guard let text = String(data: data, encoding: .utf8) else { throw FetchError.badBody }
-        return text
+        guard let url = URL(string: raw), let host = url.host, !host.isEmpty,
+              let scheme = url.scheme?.lowercased(), scheme == "http" || scheme == "https" else {
+            throw FetchError.badURL
+        }
+
+        var lastError: Error?
+        for ua in userAgents {
+            var req = URLRequest(url: url)
+            req.setValue(ua, forHTTPHeaderField: "User-Agent")
+            req.setValue("*/*", forHTTPHeaderField: "Accept")
+            do {
+                let (data, resp) = try await session(settings).data(for: req)
+                if let http = resp as? HTTPURLResponse, !(200...399).contains(http.statusCode) {
+                    lastError = FetchError.http(http.statusCode)
+                    continue
+                }
+                guard let text = String(data: data, encoding: .utf8) else {
+                    lastError = FetchError.badBody
+                    continue
+                }
+                let body = text.trimmingCharacters(in: .whitespacesAndNewlines)
+                if body.isEmpty {
+                    lastError = FetchError.emptyBody
+                    continue
+                }
+                let lower = body.lowercased()
+                if lower.hasPrefix("<!doctype") || lower.hasPrefix("<html") || lower.contains("<body") {
+                    lastError = FetchError.htmlPage(snippet(body))
+                    continue
+                }
+                return text
+            } catch {
+                lastError = error
+            }
+        }
+        throw lastError ?? FetchError.badBody
     }
 }
 
@@ -60,19 +121,39 @@ enum Fetcher {
 enum SubParser {
     static func decodeBase64(_ s: String) -> String? {
         var t = s.trimmingCharacters(in: .whitespacesAndNewlines)
+            .replacingOccurrences(of: "\n", with: "")
+            .replacingOccurrences(of: "\r", with: "")
+            .replacingOccurrences(of: " ", with: "")
             .replacingOccurrences(of: "-", with: "+")
             .replacingOccurrences(of: "_", with: "/")
         guard !t.isEmpty else { return nil }
+        // 去掉非 base64 字符
+        let allowed = CharacterSet(charactersIn: "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=")
+        t = t.unicodeScalars.filter { allowed.contains($0) }.map(String.init).joined()
         while t.count % 4 != 0 { t += "=" }
-        guard let data = Data(base64Encoded: t) else { return nil }
+        guard let data = Data(base64Encoded: t), data.count > 8 else { return nil }
         return String(data: data, encoding: .utf8)
     }
 
+    /// 多格式自动识别：Clash YAML → Surge 配置 → JSON → Base64 → URI 行
     static func parse(_ text: String) -> [ProxyNode] {
-        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        if let clash = parseClash(trimmed), !clash.isEmpty { return clash }
-        var body = trimmed
-        if !body.contains("://"), let decoded = decodeBase64(body) { body = decoded }
+        var body = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        if body.hasPrefix("\u{FEFF}") { body.removeFirst() }
+        guard !body.isEmpty else { return [] }
+
+        if let nodes = parseClash(body), !nodes.isEmpty { return nodes }
+        if let nodes = parseSurgeConfig(body), !nodes.isEmpty { return nodes }
+        if let nodes = parseJSON(body), !nodes.isEmpty { return nodes }
+
+        if !body.contains("://"), let decoded = decodeBase64(body) {
+            let inner = decoded.trimmingCharacters(in: .whitespacesAndNewlines)
+            if let nodes = parseClash(inner), !nodes.isEmpty { return nodes }
+            if let nodes = parseSurgeConfig(inner), !nodes.isEmpty { return nodes }
+            if let nodes = parseJSON(inner), !nodes.isEmpty { return nodes }
+            let uriNodes = parseLines(inner)
+            if !uriNodes.isEmpty { return uriNodes }
+        }
+
         return parseLines(body)
     }
 
@@ -82,6 +163,7 @@ enum SubParser {
         for line in lines {
             let t = String(line).trimmingCharacters(in: .whitespaces)
             if t.isEmpty || t.hasPrefix("#") || t.hasPrefix(";") || t.hasPrefix("//") { continue }
+            if t.hasPrefix("STATUS=") || t.hasPrefix("REMARKS=") { continue }
             if let node = parseURI(t) { nodes.append(node) }
         }
         return nodes
@@ -114,7 +196,7 @@ enum SubParser {
         guard let colon = body.lastIndex(of: ":") else { return nil }
         let host = String(body[body.startIndex..<colon])
         let portStr = String(body[body.index(after: colon)...])
-        guard !host.isEmpty, let port = Int(portStr) else { return nil }
+        guard !host.isEmpty, let port = Int(portStr), port > 0 else { return nil }
         return (host, port)
     }
 
@@ -180,6 +262,94 @@ enum SubParser {
         let label = name.isEmpty ? host : name
         return ProxyNode(name: label, kind: kind, server: host, port: port,
                          raw: line, region: detectRegion(label))
+    }
+
+    // MARK: Surge 配置格式（[Proxy] / [Server]）
+
+    static func parseSurgeConfig(_ text: String) -> [ProxyNode]? {
+        guard text.contains("[Proxy]") || text.contains("[Server]") else { return nil }
+        var nodes: [ProxyNode] = []
+        var inSection = false
+
+        for raw in text.split(separator: "\n", omittingEmptySubsequences: false) {
+            let line = String(raw).trimmingCharacters(in: .whitespaces)
+            if line.isEmpty || line.hasPrefix("#") || line.hasPrefix(";") || line.hasPrefix("//") { continue }
+            if line.hasPrefix("[") && line.hasSuffix("]") {
+                let sec = line.trimmingCharacters(in: CharacterSet(charactersIn: "[]"))
+                inSection = (sec == "Proxy" || sec == "Server")
+                continue
+            }
+            guard inSection, let eq = line.firstIndex(of: "=") else { continue }
+            let name = String(line[line.startIndex..<eq]).trimmingCharacters(in: .whitespaces)
+            let rhs = String(line[line.index(after: eq)...])
+            let fields = rhs.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }
+            guard fields.count >= 3 else { continue }
+            let type = fields[0].lowercased()
+            let kind: ProxyKind
+            switch type {
+            case "ss": kind = .ss
+            case "ssr": kind = .ssr
+            case "vmess": kind = .vmess
+            case "vless": kind = .vless
+            case "trojan": kind = .trojan
+            case "hysteria2", "hy2": kind = .hysteria2
+            case "tuic": kind = .tuic
+            default: continue
+            }
+            let server = fields[1]
+            guard let port = Int(fields[2]), port > 0 else { continue }
+            let label = name.isEmpty ? server : name
+            nodes.append(ProxyNode(name: label, kind: kind, server: server, port: port,
+                                   raw: "", region: detectRegion(label)))
+        }
+        return nodes.isEmpty ? nil : nodes
+    }
+
+    // MARK: JSON 格式（sing-box / v2rayN 等）
+
+    static func parseJSON(_ text: String) -> [ProxyNode]? {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmed.hasPrefix("{") || trimmed.hasPrefix("[") else { return nil }
+        guard let data = trimmed.data(using: .utf8),
+              let any = try? JSONSerialization.jsonObject(with: data) else { return nil }
+
+        var nodes: [ProxyNode] = []
+
+        func walk(_ value: Any) {
+            if let dict = value as? [String: Any] {
+                if let node = nodeFromJSON(dict) { nodes.append(node) }
+                for (_, v) in dict { walk(v) }
+            } else if let array = value as? [Any] {
+                for item in array { walk(item) }
+            }
+        }
+        walk(any)
+        return nodes.isEmpty ? nil : nodes
+    }
+
+    private static func nodeFromJSON(_ dict: [String: Any]) -> ProxyNode? {
+        let typeRaw = (dict["type"] as? String)?.lowercased() ?? ""
+        let kind: ProxyKind
+        switch typeRaw {
+        case "ss", "shadowsocks": kind = .ss
+        case "ssr", "shadowsocksr": kind = .ssr
+        case "vmess": kind = .vmess
+        case "vless": kind = .vless
+        case "trojan": kind = .trojan
+        case "hysteria2", "hy2": kind = .hysteria2
+        case "tuic": kind = .tuic
+        default: return nil
+        }
+        let server = (dict["server"] as? String) ?? (dict["address"] as? String) ?? ""
+        var port = 0
+        if let p = dict["server_port"] as? Int { port = p }
+        else if let p = dict["port"] as? Int { port = p }
+        else if let p = dict["server_port"] as? String { port = Int(p) ?? 0 }
+        else if let p = dict["port"] as? String { port = Int(p) ?? 0 }
+        guard !server.isEmpty, port > 0 else { return nil }
+        let name = (dict["tag"] as? String) ?? (dict["name"] as? String) ?? (dict["remarks"] as? String) ?? server
+        return ProxyNode(name: name, kind: kind, server: server, port: port,
+                         raw: "", region: detectRegion(name))
     }
 
     // MARK: Clash / Mihomo YAML
@@ -527,7 +697,6 @@ enum Speed {
                            mbps: down.0, okX: xRes.1, okTG: tgRes.1, time: Date())
     }
 
-    // 节点服务器 TCP 建连延迟（真实可测，不需要内核）
     static func tcpPing(host: String, port: Int, timeout: TimeInterval = 4) async -> (Int, Bool) {
         await withCheckedContinuation { (cont: CheckedContinuation<(Int, Bool), Never>) in
             guard let nwPort = NWEndpoint.Port(rawValue: UInt16(clamping: port)) else {
