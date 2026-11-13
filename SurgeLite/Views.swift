@@ -186,7 +186,7 @@ struct OverviewView: View {
             }
             Divider().padding(.leading, 38)
             Button { showExport = true } label: {
-                row(icon: "doc.text", title: "导出配置", detail: "生成可粘贴进 Surge 的规则片段")
+                row(icon: "doc.text", title: "导出配置", detail: "规则片段 / 节点 / Base64 订阅")
             }
         }
         .card()
@@ -301,48 +301,57 @@ struct SubscriptionsView: View {
     @ObservedObject var store: Store
     @State private var showAdd = false
     @State private var busySub: UUID? = nil
+    @State private var busyAll = false
 
     var body: some View {
         NavigationStack {
             List {
                 if store.state.subscriptions.isEmpty {
                     Section {
-                        Text("还没有订阅。点右上角 + 添加订阅链接，会自动识别 Clash / Base64 / URI 列表。")
+                        Text("还没有订阅。点右上角 + 添加订阅链接，多条订阅会自动合并去重。")
                             .font(.footnote).foregroundStyle(.secondary)
                     }
-                }
-                ForEach($store.state.subscriptions) { $sub in
-                    VStack(alignment: .leading, spacing: 6) {
-                        HStack {
-                            Text(sub.name).font(.subheadline.weight(.semibold))
-                            Spacer()
-                            Text("\(sub.nodeCount) 节点").font(.caption).foregroundStyle(.secondary)
-                        }
-                        Text(sub.url).font(.caption2).foregroundStyle(.secondary).lineLimit(2)
-                        HStack(spacing: 8) {
-                            Text(sub.updatedAt.formatted(date: .numeric, time: .shortened))
-                                .font(.caption2).foregroundStyle(.tertiary)
-                            Spacer()
-                            if busySub == sub.id {
-                                ProgressView().controlSize(.mini)
-                            } else {
-                                Button("更新") { refresh(sub) }
-                                    .buttonStyle(.bordered)
-                                    .controlSize(.mini)
+                } else {
+                    Section {
+                        ForEach($store.state.subscriptions) { $sub in
+                            VStack(alignment: .leading, spacing: 6) {
+                                HStack {
+                                    Toggle("", isOn: $sub.enabled).labelsHidden()
+                                    Text(sub.name).font(.subheadline.weight(.semibold))
+                                    Spacer()
+                                    Text("\(sub.nodeCount) 节点").font(.caption).foregroundStyle(.secondary)
+                                }
+                                Text(sub.url).font(.caption2).foregroundStyle(.secondary).lineLimit(2)
+                                HStack(spacing: 8) {
+                                    Text(sub.updatedAt.formatted(date: .numeric, time: .shortened))
+                                        .font(.caption2).foregroundStyle(.tertiary)
+                                    Spacer()
+                                    if busySub == sub.id {
+                                        ProgressView().controlSize(.mini)
+                                    } else {
+                                        Button("更新") { refresh(sub) }
+                                            .buttonStyle(.bordered)
+                                            .controlSize(.mini)
+                                    }
+                                }
+                                if !sub.lastError.isEmpty {
+                                    Text(sub.lastError).font(.caption2).foregroundStyle(.red)
+                                }
                             }
+                            .padding(.vertical, 2)
                         }
-                        if !sub.lastError.isEmpty {
-                            Text(sub.lastError).font(.caption2).foregroundStyle(.red)
+                        .onDelete { offsets in
+                            let removed = offsets.map { store.state.subscriptions[$0] }
+                            store.state.subscriptions.remove(atOffsets: offsets)
+                            for sub in removed { store.removeNodes(of: sub.name) }
                         }
                     }
-                    .padding(.vertical, 2)
-                }
-                .onDelete { offsets in
-                    store.state.subscriptions.remove(atOffsets: offsets)
                 }
 
                 if !store.state.nodes.isEmpty {
                     Section("节点管理") {
+                        Text("当前共 \(store.state.nodes.count) 个节点（已去重）")
+                            .font(.caption).foregroundStyle(.secondary)
                         Button("清空全部节点", role: .destructive) { store.clearNodes() }
                     }
                 }
@@ -350,12 +359,21 @@ struct SubscriptionsView: View {
             .navigationTitle("订阅")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
+                ToolbarItem(placement: .topBarLeading) {
+                    if busyAll {
+                        ProgressView().controlSize(.small)
+                    } else {
+                        Button("全部更新") { refreshAll() }
+                            .font(.footnote)
+                            .disabled(store.state.subscriptions.isEmpty)
+                    }
+                }
                 ToolbarItem(placement: .topBarTrailing) {
                     Button { showAdd = true } label: { Image(systemName: "plus") }
                 }
             }
             .sheet(isPresented: $showAdd) { AddSubscriptionView(store: store) }
-            .alert("提示", isPresented: Binding(
+            .alert("结果", isPresented: Binding(
                 get: { !store.message.isEmpty },
                 set: { if !$0 { store.message = "" } }
             )) {
@@ -376,11 +394,47 @@ struct SubscriptionsView: View {
                     busySub = nil
                     return
                 }
-                store.merge(nodes: nodes, subscription: sub)
+                let res = store.merge(nodes: nodes, subscription: sub)
+                store.message = "\(sub.name)：新增 \(res.added) 个，跳过重复 \(res.skipped) 个"
             } catch {
                 markError(sub, error.localizedDescription)
             }
             busySub = nil
+        }
+    }
+
+    private func refreshAll() {
+        let subs = store.state.subscriptions.filter { $0.enabled }
+        guard !subs.isEmpty else {
+            store.message = "没有启用的订阅"
+            return
+        }
+        busyAll = true
+        let settings = store.state.settings
+        Task {
+            var added = 0
+            var skipped = 0
+            var failed = 0
+            for sub in subs {
+                do {
+                    let text = try await Fetcher.fetch(sub.url, settings: settings)
+                    let nodes = SubParser.parse(text)
+                    if nodes.isEmpty {
+                        markError(sub, "没有解析出节点")
+                        failed += 1
+                        continue
+                    }
+                    let res = store.merge(nodes: nodes, subscription: sub)
+                    added += res.added
+                    skipped += res.skipped
+                } catch {
+                    markError(sub, error.localizedDescription)
+                    failed += 1
+                }
+            }
+            busyAll = false
+            store.message = "全部更新完成：新增 \(added)，重复跳过 \(skipped)"
+                + (failed > 0 ? "，\(failed) 条订阅失败" : "")
         }
     }
 
@@ -468,6 +522,7 @@ struct NodesView: View {
     @ObservedObject var store: Store
     @State private var keyword = ""
     @State private var region = "全部"
+    @State private var source = "全部"
     @State private var testing = false
 
     private var regions: [String] {
@@ -476,9 +531,16 @@ struct NodesView: View {
         return Array(set).sorted()
     }
 
+    private var sources: [String] {
+        var set = Set(store.state.nodes.map { $0.source })
+        set.insert("全部")
+        return Array(set).sorted()
+    }
+
     private var filtered: [ProxyNode] {
         store.state.nodes.filter { node in
             (region == "全部" || node.region == region) &&
+            (source == "全部" || node.source == source) &&
             (keyword.isEmpty || node.name.localizedCaseInsensitiveContains(keyword) || node.server.contains(keyword))
         }
     }
@@ -505,6 +567,17 @@ struct NodesView: View {
                             .padding(.vertical, 8)
                             .background(Color(.secondarySystemBackground), in: RoundedRectangle(cornerRadius: 9))
                     }
+                    Menu {
+                        ForEach(sources, id: \.self) { s in
+                            Button(s) { source = s }
+                        }
+                    } label: {
+                        Image(systemName: "line.3.horizontal.decrease")
+                            .font(.caption.weight(.medium))
+                            .padding(.horizontal, 10)
+                            .padding(.vertical, 8)
+                            .background(Color(.secondarySystemBackground), in: RoundedRectangle(cornerRadius: 9))
+                    }
                 }
                 .padding(.horizontal, 16)
                 .padding(.vertical, 8)
@@ -524,7 +597,7 @@ struct NodesView: View {
                                     .background(Color(.tertiarySystemFill), in: Capsule())
                                 VStack(alignment: .leading, spacing: 2) {
                                     Text(node.name).font(.subheadline).lineLimit(1)
-                                    Text("\(node.kind.label) · \(node.endpoint)")
+                                    Text("\(node.kind.label) · \(node.source)")
                                         .font(.caption2).foregroundStyle(.secondary).lineLimit(1)
                                 }
                                 Spacer()
